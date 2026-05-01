@@ -28,9 +28,10 @@ of early-type galaxies and provides:
 - Automated SVM classification tests to separate cD‑like from E‑like 
   galaxies.
 
-The script is written for two fixed samples: 'WHL' and 'L07'.  Data files
-are expected to follow a strict naming convention and are assumed to
-reside in appropriate sub‑directories.  Many functions depend on global
+The script is written for two fixed samples: 'WHL' and 'L07'. But can be used with any sample
+the only difference will be the specific data that are required at some parts and functions
+which can be avoided with a simple `if` loop. Data files are expected to follow a strict naming convention and are assumed to
+reside in appropriate sub‑directories. Many functions depend on global
 variables that are defined in the main block; this is a legacy design
 and is clearly documented below.
 
@@ -1676,7 +1677,7 @@ def casjobs_jointplots(info_need,lim_region,l07_regions):
 		plt.close()
 	return
 ###################################################################################
-# FUNÇÕES COM VÁRIAVEIS GLOBAIS - QUE ENVOLVE CHAMAR PRIMEIRO OS RESULTS
+# FUNCTIONS THAT USE GLOBAL VARIABLES - WHICH ARE STATED ON THE 'MAIN' BLOCK
 def plots_kde(cut_data):
 	import pandas as pd
 	"""Master orchestrator that generates KDE, histogram, KS‑test, and
@@ -7010,7 +7011,7 @@ def m200_coeff_stripes(xy_mesh,stripe_entry,coeff_entry,m200_vet):
 	return x_peak_vec,y_peak_vec,alpha_values,alpha_incs,beta_values,beta_incs
 ###################################################################################
 ###################################################################################
-#DEFINIÇÕES DOS LIMITES E DAS SUB-AMOSTRAS
+#FUNCTIONS THAT DEFINE THE SAMPLE AND BUILD THE CONSTRAINTS
 def lim_sample_builder():
 	"""Read all input data files, apply initial quality cuts, and return
 	the fundamental boolean masks.
