@@ -17,5 +17,5 @@ That said, the codes won't be specifically used only on my research, one of my g
 
 
 ---
-~Therefore any advice or assist to understand my codes or any thought about this subject open an issue or send an email to pompeokaipper@gmail.com. I will try to answer as fast as possible.~
+~~Therefore any advice or assist to understand my codes or any thought about this subject open an issue or send an email to pompeokaipper@gmail.com. I will try to answer as fast as possible.~~
 
