@@ -1,3 +1,27 @@
+"""
+profit_anysample_fix_psf.py
+
+Automated 2D surface‑photometry fitting of BCG (Brightest Cluster Galaxy) stamps.
+
+This module manages the full pipeline for fitting single‑Sérsic, Sérsic+Exponential,
+and double‑Sérsic (Sérsic+Sérsic) models to galaxy images using the ``profit``
+optimisation library.  It is designed to work with two pre‑defined samples
+('WHL' and 'L07') and supports three modes:
+
+- **Observation** (``modeltype=0``): fit real data.
+- **Simulation on single‑Sérsic** (``modeltype=1``): generate a mock galaxy from
+  the best single‑Sérsic model, add noise, and re‑fit.
+- **Simulation on double‑Sérsic** (``modeltype=2``): generate a mock galaxy from
+  the best double‑Sérsic model and re‑fit.
+
+The script also computes the Residual Flux Fraction (RFF) and performs basic
+model selection (BIC).  Parallelisation is achieved via ``multiprocessing``.
+
+**Global dependency:** The module‑level variable ``sample`` must be set (e.g.,
+via command‑line argument) before calling any function that constructs file
+paths.  Many functions rely on external files with a fixed naming convention.
+"""
+
 import itertools
 import os
 
@@ -16,7 +40,32 @@ import warnings
 import numpy.ma as ma
 
 warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------------------
+# Callback functions for optimisation monitoring
+# ----------------------------------------------------------------------
+
 def make_callback(cluster, data, save_value, model):
+	"""Return a callback that logs likelihood and parameters during optimisation.
+
+	The callback is invoked by ``scipy.optimize.minimize`` at each iteration.
+	It writes the current negative log‑likelihood and the parameter vector to
+	text files inside the cluster's output directory.
+
+	Args:
+		cluster    (str): Cluster identifier.
+		data       (ProfitData): The ``profit`` data object (not used inside
+					 the callback, but required by the signature of the caller).
+		save_value (str): Tag used to construct the output file names.
+		model      (str): Model name (e.g., 'sersic', 'sersic_exp').
+
+	Returns:
+		function: A closure with signature ``callback(params_iter)``.
+
+	Note:
+		The returned callback depends on the global ``sample`` variable.
+	"""
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	def callback_fn(params_iter):
 		ll = -profit_like_model(params_iter, data)
@@ -26,6 +75,18 @@ def make_callback(cluster, data, save_value, model):
 			hist_params.write(f'{" ".join(str(x) for x in params_iter.copy())}\n')
 	return callback_fn
 def make_callback_simul_s(cluster,data,save_value,model):
+	"""Same as ``make_callback``, but dedicated to single‑Sérsic simulations.
+
+	This duplicate exists for historical reasons; its behaviour is identical
+	to ``make_callback``.
+
+	Args:
+		cluster, data, save_value, model: See ``make_callback``.
+
+	Returns:
+		function: Logging callback.
+	"""
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	def callback_fn(params_iter):
 		ll = -profit_like_model(params_iter, data)
@@ -35,6 +96,16 @@ def make_callback_simul_s(cluster,data,save_value,model):
 			hist_params.write(f'{" ".join(str(x) for x in params_iter.copy())}\n')
 	return callback_fn
 def make_callback_simul_ss(cluster,data,save_value,model):
+	"""Same as ``make_callback``, but dedicated to double‑Sérsic simulations.
+
+	Args:
+		cluster, data, save_value, model: See ``make_callback``.
+
+	Returns:
+		function: Logging callback.
+	"""
+
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	def callback_fn(params_iter):
 		ll = -profit_like_model(params_iter, data)
@@ -45,6 +116,19 @@ def make_callback_simul_ss(cluster,data,save_value,model):
 	return callback_fn
 
 def make_callback_simul_se(cluster,data,save_value,model):
+	"""Same as ``make_callback``, but writes to files with a ``simul_se`` tag.
+
+	This is used specifically for the Sérsic+Exponential model during
+	double‑Sérsic simulations.
+
+	Args:
+		cluster, data, save_value, model: See ``make_callback``.
+
+	Returns:
+		function: Logging callback.
+	"""
+
+
 	hist_likelihood=open(f'{sample}/{cluster}/{save_value}/hist_likelihood_simul_se_{model}_{save_value}.dat','a')
 	hist_params=open(f'{sample}/{cluster}/{save_value}/hist_params_simul_se_{model}_{save_value}.dat','a')
 	def callback_fn(params_iter):
@@ -53,7 +137,37 @@ def make_callback_simul_se(cluster,data,save_value,model):
 		hist_params.write(f'{" ".join(str(x) for x in params_iter.copy())}\n')
 	return callback_fn
 #####################################################
+# ----------------------------------------------------------------------
+# Utility functions
+# ----------------------------------------------------------------------
+
 def rff_calc(sample,cluster,figname,save_value):
+	"""Compute the Residual Flux Fraction (RFF) from a fitted model image.
+
+	RFF is defined as the total absolute residual flux inside the galaxy
+	mask, after subtracting 0.8× the sky RMS per pixel to account for noise
+	fluctuations, divided by the total galaxy flux.
+
+	Uses:
+	- HDU 1 of the FITS file ``figname`` as the galaxy image.
+	- HDU 3 of the same file as the model residual image.
+	- Background mask ``bcg_r_mask.fits`` and bulge mask ``bcg_r_mask_b.fits``.
+
+	Args:
+		sample     (str): Sample name ('WHL' or 'L07').
+		cluster    (str): Cluster identifier.
+		figname    (str): Name of the FITS file containing model and residual.
+		save_value (str): Tag used as part of the path inside the cluster directory.
+
+	Returns:
+		float: Residual Flux Fraction.
+
+	Note:
+		Assumes the FITS files are located under
+		``{sample}/{cluster}/{save_value}/`` and ``../{sample}/{cluster}/``.
+	"""
+
+
 	
 
 	ajust1 = fits.getdata(f'{sample}/{cluster}/{save_value}/{figname}',1)
@@ -73,10 +187,60 @@ def rff_calc(sample,cluster,figname,save_value):
 	rff=(xy-0.8*sbk*nn2)/xn
 	return rff
 def prior_func(s):
+	"""Return a zero‑centred normal log‑PDF with fixed standard deviation ``s``.
+
+	This is used to create a weak Gaussian prior for ``profit`` parameters.
+
+	Args:
+		s (float): Standard deviation of the prior.
+
+	Returns:
+		function: A callable ``norm_with_fixed_sigma(x)`` that evaluates the
+		log‑probability of ``x`` under N(0, s).
+	"""
+
+
 	def norm_with_fixed_sigma(x):
 		return stats.norm.logpdf(x, 0, s)
 	return norm_with_fixed_sigma
 def centro_magzero(sample,cluster,save_value,psf):
+	"""Determine initial galaxy centre, magnitude, shape, and sky properties.
+
+	This function:
+	1. Converts the background‑subtracted image from nano‑maggies to flux units.
+	2. Generates a SExtractor configuration file and runs SExtractor on the
+	   original stamp to find the brightest object.
+	3. Estimates initial values for magnitude, effective radius, position angle,
+	   axial ratio, and sky background.
+	4. Creates a circular mask (diameter 1.5 × PSF FWHM) around the centre to
+	   exclude the central pixel region during fitting.
+
+	Args:
+		sample     (str): Sample name.
+		cluster    (str): Cluster identifier.
+		save_value (str): Path tag for intermediate files.
+		psf        (2D ndarray): PSF image used to measure the FWHM.
+
+	Returns:
+		tuple:
+			xc, yc            (float): Fitted centre coordinates (from SExtractor).
+			mag               (float): Initial apparent magnitude.
+			pa                (float): Position angle (deg; 0 = north, E of N).
+			ax                (float): Axial ratio (b/a).
+			re                (float): Estimated effective radius in arcsec.
+			magzero           (float): MAGZPT + 2.5 log10(EXPTIME).
+			sigma_sky         (float): Sky RMS (standard deviation).
+			median_sky        (float): Median sky level.
+			mask_center       (2D int array): Central mask (0 = good, 1 = masked).
+			sum_vec_1         (float): Sum of pixel values inside the galaxy mask.
+
+	Note:
+		Writes a temporary SExtractor configuration and catalogue, then
+		deletes the check images.  Relies on ``base_default.sex`` in the
+		current working directory.
+	"""
+
+
 	import photutils.psf as ppsf
 	import photutils.aperture as phta
 	from math import floor
@@ -180,8 +344,34 @@ def centro_magzero(sample,cluster,save_value,psf):
 
 	return xc,yc,mag,pa,ax,re,magzero,sigma_sky,median_sky,mask_center,sum(vec_1)
 ##############################################################################################
-#CONSTRUÇÃO INICIAL DOS MODELOS
+# ----------------------------------------------------------------------
+# Model initialisation functions
+# ----------------------------------------------------------------------
 def sersic_unico(sample,cluster,save_value,psf):
+	"""Set up the initial parameters and bounds for a single‑Sérsic fit.
+
+	Calls ``centro_magzero`` to obtain initial guesses and then constructs
+	the parameter vector (xcen, ycen, mag, re, n, ang, axrat, box, sky)
+	with reasonable sigmas, lower, and upper bounds.  The Sérsic index ``n``
+	is started at 4.0 and boxiness at 0.0.
+
+	Args:
+		sample, cluster, save_value, psf: See ``centro_magzero``.
+
+	Returns:
+		tuple:
+			magzero (float): Magnitude zero‑point.
+			names   (list of str): Parameter names in ``profit`` format.
+			model0  (ndarray): Initial parameter values.
+			tofit   (ndarray of bool): Which parameters are free.
+			tolog   (ndarray of bool): Which parameters are fitted in log10.
+			sigmas  (ndarray): Prior sigmas.
+			priors  (list of callables): Prior functions.
+			lowers  (ndarray): Lower bounds.
+			uppers  (ndarray): Upper bounds.
+	"""
+
+
 	#####
 	xc,yc,mag,pa,ax,re,magzero,sigma_sky,median_sky,_,_=centro_magzero(sample,cluster,save_value,psf)
 	n =4.
@@ -201,6 +391,26 @@ def sersic_unico(sample,cluster,save_value,psf):
 	priors = np.array([prior_func(s) for s in sigmas])
 	return magzero,names, model0, tofit, tolog, sigmas, priors, lowers, uppers
 def sersic_exp(sample,cluster,data_entry,img_siz):
+	"""Set up initial parameters for a Sérsic + Exponential fit.
+
+	The initial values are derived from a previously determined Sérsic
+	solution ``data_entry``, with the exponential component assumed to have
+	half the effective radius and a magnitude offset.
+
+	Args:
+		sample      (str): Sample name.
+		cluster     (str): Cluster identifier (only used to obtain sky RMS).
+		data_entry  (array_like): 9‑element vector [xc, yc, mag, re, n,
+								  pa, axrat, box, sky] from a Sérsic fit.
+		img_siz     (int or tuple): Image dimensions (only max extent used
+								   for upper bound of effective radius).
+
+	Returns:
+		tuple: (names, model0, tofit, tolog, sigmas, priors, lowers, uppers)
+			   analogous to ``sersic_unico`` but for the two‑component model.
+	"""
+
+
 
 	xc,yc,mag,re,n,pa,ax,box,sky = data_entry
 	sigma_sky=centro_magzero(sample,cluster)[7]
@@ -237,6 +447,22 @@ def sersic_exp(sample,cluster,data_entry,img_siz):
 
 	return names, model0, tofit, tolog, sigmas, priors, lowers, uppers
 def sersic_duplo(sample,cluster,data_entry,img_siz,save_value,psf):
+	"""Set up initial parameters for a double‑Sérsic (Sérsic+Sérsic) fit.
+
+	The two components are initialised from the single‑Sérsic values in
+	``data_entry``, with the second component initially having a smaller
+	effective radius and similar brightness.
+
+	Args:
+		sample, cluster, data_entry, img_siz, save_value, psf:
+			See ``sersic_exp``.  ``save_value`` and ``psf`` are passed to
+			``centro_magzero`` to recompute sky RMS.
+
+	Returns:
+		tuple: (magzero, names, model0, tofit, tolog, sigmas, priors, lowers, uppers)
+	"""
+
+
 
 	xc,yc,mag,re,n,pa,ax,box,sky = data_entry
 
@@ -271,8 +497,28 @@ def sersic_duplo(sample,cluster,data_entry,img_siz,save_value,psf):
 	priors = np.array([prior_func(s) for s in sigmas])
 	return magzero,names, model0, tofit, tolog, sigmas, priors, lowers, uppers
 ###########################################################################################
-#CONSTRUÇÃO DOS MODELOS
+# ----------------------------------------------------------------------
+# File‑naming helper
+# ----------------------------------------------------------------------
+###########################################################################################
 def infotype(modeltype,save_value):
+	"""Return standardised filenames and output file name for a given mode.
+
+	Args:
+		modeltype  (int): 0 (observation), 1 (simulation on single‑Sérsic),
+						  or 2 (simulation on double‑Sérsic).
+		save_value (str): A tag that is embedded in the filenames.
+
+	Returns:
+		tuple:
+			name_s_ajust   (str): FITS file name for the single‑Sérsic fit.
+			name_se_ajust  (str): FITS file name for the Sérsic+Exp fit.
+			name_ss_ajust  (str): FITS file name for the double‑Sérsic fit.
+			save_file      (str): Name of the summary output file
+								 ('output_obs.dat', etc.).
+	"""
+
+
 	if modeltype==0:
 		name_s_ajust=f'ajust-sersic-llh-{save_value}.fits'
 		name_se_ajust=f'ajust-sersic-exp-llh-{save_value}.fits'
@@ -289,8 +535,42 @@ def infotype(modeltype,save_value):
 		name_ss_ajust=f'ajust-simul-ss-sersic-duplo-llh-{save_value}.fits'
 		save_file='output_simul_ss.dat'
 	return	name_s_ajust,name_se_ajust,name_ss_ajust,save_file
-
+###########################################################################################
+# ----------------------------------------------------------------------
+# Fitting core
+# ----------------------------------------------------------------------
+###########################################################################################
 def build_data(cluster, image, mask, sigim, segim, psf,	magzero, names, model0, tofit, tolog, sigmas, priors, lowers, uppers,mask_center=None):
+	"""Wrap the ``profit_setup_data`` function to build a ``ProfitData`` object.
+
+	Args:
+		cluster    (str): Cluster ID.
+		image      (2D array): Galaxy stamp image.
+		mask       (2D bool array): Mask of pixels to exclude (1 = masked).
+		sigim      (2D array): Noise (sigma) image.
+		segim      (2D bool array): Segmentation map (1 = source).
+		psf        (2D array): PSF image.
+		magzero    (float): Magnitude zero‑point.
+		names      (list of str): Parameter names.
+		model0     (array): Initial parameter values.
+		tofit      (bool array): Which parameters to vary.
+		tolog      (bool array): Which parameters to fit in log space.
+		sigmas     (array): Prior sigmas.
+		priors     (list of callables): Prior functions.
+		lowers     (array): Lower bounds.
+		uppers     (array): Upper bounds.
+		mask_center (2D bool array, optional): Additional central mask.
+					 If None, an all‑False mask of the same shape as ``image``
+					 is used.
+
+	Returns:
+		profit_optim_v4.ProfitData: Data container for ``profit`` optimisation.
+
+	Note:
+		Requires the module ``profit_optim_v4`` to be importable.
+	"""
+
+
 	from profit_optim_v4 import profit_setup_data
 
 	data = profit_setup_data(
@@ -301,6 +581,35 @@ def build_data(cluster, image, mask, sigim, segim, psf,	magzero, names, model0, 
 
 	return data
 def sersic_fit(sample,cluster,image, mask, sigim, segim, psf,modeltype,save_value):
+	"""Fit a single‑Sérsic model to the galaxy image.
+
+	If the output FITS file already exists, the function returns immediately
+	(skip already‑processed object).  Otherwise it:
+	1. Initialises the model via ``sersic_unico``.
+	2. Builds the ``ProfitData`` object.
+	3. Minimises the negative log‑likelihood using L‑BFGS‑B.
+	4. Computes BIC, cleaned log‑likelihood, and parameter uncertainties
+	   from the Hessian.
+	5. Saves the data, model, and residual images into a three‑extension
+	   FITS file, along with all relevant metadata in the headers.
+
+	Args:
+		sample     (str): Sample name.
+		cluster    (str): Cluster identifier.
+		image      (2D array): Galaxy stamp image.
+		mask       (2D bool array): Source mask (1 = bad).
+		sigim      (2D array): Noise image.
+		segim      (2D bool array): Segmentation map.
+		psf        (2D array): PSF image.
+		modeltype  (int): Mode (0/1/2) – determines which callback and
+						  output names are used.
+		save_value (str): Tag for output files.
+
+	Returns:
+		None.  The results are written to disk.
+	"""
+
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	print(f'{cluster} SERSIC')
 	name_s_ajust=infotype(modeltype,save_value)[0]
@@ -370,6 +679,32 @@ def sersic_fit(sample,cluster,image, mask, sigim, segim, psf,modeltype,save_valu
 	print(f'{cluster} SERSIC FINALIZADO')
 	return
 def sersic_exp_fit(sample,cluster,image, mask, sigim, segim, psf,magzero,fit_params_sersic,modeltype,save_value):
+	"""Fit a Sérsic+Exponential model, using results from a previous Sérsic fit.
+
+	If the output FITS file already exists, the parameters are read from its
+	header and the function returns early.
+
+	Args:
+		sample            (str): Sample name.
+		cluster           (str): Cluster identifier.
+		image, mask, sigim, segim, psf: Input data.
+		magzero           (float): Magnitude zero‑point.
+		fit_params_sersic (array): 9 Sérsic parameters from a prior fit.
+								   If the first element is -1000, a default
+								   initialisation is used (fallback).
+		modeltype         (int): Mode 0/1/2.
+		save_value        (str): Tag for output files.
+
+	Returns:
+		None.  Results are saved to a FITS file.
+
+	Note:
+		The Exponential component's Sérsic index is fixed to 1.0 (tofit[7]
+		is False), so only the surface brightness and scale length are
+		free parameters for the disk.
+	"""
+
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	print(f'{cluster} SERSIC + EXP')
 	name_se_ajust=infotype(modeltype,save_value)[1]
@@ -469,6 +804,22 @@ def sersic_exp_fit(sample,cluster,image, mask, sigim, segim, psf,magzero,fit_par
 		print(f'{cluster} SERSIC + EXP FINALIZADO')
 	return
 def sersic_duplo_fit(sample,cluster,image, mask, sigim, segim, psf,modeltype,save_value):
+	"""Fit a double‑Sérsic (Sérsic+Sérsic) model, optionally reusing a Sérsic fit.
+
+	If the FITS result already exists, it is skipped.  Otherwise the initial
+	parameters are obtained from ``sersic_duplo``, using the single‑Sérsic
+	solution if available, or defaults if not.
+
+	Args:
+		sample, cluster, image, mask, sigim, segim, psf: Input data.
+		modeltype  (int): Mode (0/1/2).
+		save_value (str): Tag for output.
+
+	Returns:
+		None.  Results saved to FITS.
+	"""
+
+
 	from profit_optim_v4 import profit_like_model, to_pyprofit_image_simples, to_pyprofit_image_duplo, clean_model
 	print(f'{cluster} SERSIC 2 + SERSIC 1')
 	name_ss_ajust=infotype(modeltype,save_value)[2]
@@ -559,8 +910,21 @@ def sersic_duplo_fit(sample,cluster,image, mask, sigim, segim, psf,modeltype,sav
 		print(f'{cluster} SERSIC 2 + SERSIC 1 FINALIZADO')
 	return 
 ############################################################################################
+# ----------------------------------------------------------------------
+# High‑level pipelines (called by multiprocessing wrappers)
+# ----------------------------------------------------------------------
+############################################################################################
 
 def sersic_setup(sample,cluster,save_value):
+	"""Run a single‑Sérsic fit.
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	cluster_test='1030'
 	call(f'mkdir -p {sample}/{cluster_test}',shell=True)
 	call(f'mkdir -p {sample}/{cluster_test}/{save_value}',shell=True)
@@ -579,6 +943,16 @@ def sersic_setup(sample,cluster,save_value):
 	# ajuste_sersic_duplo = sersic_duplo_fit(sample,cluster,image, mask, sigim, segim, psf,ajuste_sersic[1],ajuste_sersic[0],modeltype,save_value)
 	return 
 def sersic_duplo_setup(sample,cluster,save_value):
+	"""Run single‑Sérsic and double‑Sérsic fits.
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	##############################################################{sample}/{cluster}
 	##IMAGENS
 	cluster_test='1030'
@@ -596,6 +970,21 @@ def sersic_duplo_setup(sample,cluster,save_value):
 	return 
 
 def sersic_simul_s_setup(sample,cluster,save_value):
+	"""Simulate a single‑Sérsic galaxy and re‑fit it.
+
+	If the single‑Sérsic fit of the simulation was already done (its FITS
+	file exists), the function uses the existing image; otherwise it creates
+	a mock image by adding Gaussian noise (based on the sigma map) to the
+	best‑fit single‑Sérsic model of the real observation.
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	call(f'mkdir {sample}/{cluster}/{save_value}',shell=True)
 	##############################################################
 	modeltype=1
@@ -618,6 +1007,19 @@ def sersic_simul_s_setup(sample,cluster,save_value):
 
 	return 
 def sersic_duplo_simul_s_setup(sample,cluster,save_value):
+	"""Simulate a single‑Sérsic galaxy and fit both single‑ and double‑Sérsic models.
+
+	Same as ``sersic_simul_s_setup`` but also runs the double‑Sérsic fit on the
+	mock image.
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	call(f'mkdir {sample}/{cluster}/{save_value}',shell=True)
 	##############################################################
 	modeltype=1
@@ -641,6 +1043,19 @@ def sersic_duplo_simul_s_setup(sample,cluster,save_value):
 	return 
 
 def sersic_simul_ss_setup(sample,cluster,save_value):
+	"""Simulate a double‑Sérsic galaxy and re‑fit it.
+
+	Uses the best double‑Sérsic model from the real observation to create
+	a mock image (model + noise).  Then fits a single Sérsic model.
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	call(f'mkdir {sample}/{cluster}/{save_value}',shell=True)
 	##############################################################
 	modeltype=2
@@ -663,6 +1078,16 @@ def sersic_simul_ss_setup(sample,cluster,save_value):
 
 	return 
 def sersic_duplo_simul_ss_setup(sample,cluster,save_value):
+	"""Simulate a double‑Sérsic galaxy and fit both models (single + double).
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+
+	Returns:
+		None.
+	"""
+
+
 	call(f'mkdir {sample}/{cluster}/{save_value}',shell=True)
 	##############################################################
 	modeltype=2
@@ -686,6 +1111,20 @@ def sersic_duplo_simul_ss_setup(sample,cluster,save_value):
 	return 
 
 def desi_setup(sample,cluster,save_value,ra,dec):
+	"""Run a single‑Sérsic fit on DESI‑legacy survey data.
+
+	The input images are expected under ``../desi_{sample}/{cluster}/``.
+
+	Args:
+		sample, cluster, save_value: Standard identifiers.
+		ra, dec (float): Right ascension and declination (currently not used
+						 in the function body but passed for compatibility).
+
+	Returns:
+		None.
+	"""
+
+
 	call(f'mkdir {sample}/{cluster}/{save_value}',shell=True)
 	##############################################################{sample}/{cluster}
 	##IMAGENS
@@ -701,7 +1140,42 @@ def desi_setup(sample,cluster,save_value,ra,dec):
 	# ajuste_sersic_exp = sersic_exp_fit(sample,cluster,image, mask, sigim, segim, psf,ajuste_sersic[1],ajuste_sersic[0],modeltype,save_value)	
 	# ajuste_sersic_duplo = sersic_duplo_fit(sample,cluster,image, mask, sigim, segim, psf,ajuste_sersic[1],ajuste_sersic[0],modeltype,save_value)
 	return 
+
+# ----------------------------------------------------------------------
+# Post‑processing and summary
+# ----------------------------------------------------------------------
 def finish_details(sample,catalogo,modeltype,ass,save_value):
+	"""Gather fit results, compute BIC, and write a summary file.
+
+	For each cluster in ``catalogo`` that has not yet been processed (tracked
+	by the file ``{sample}_profit_{save_value}_chi2.dat``), this function:
+	- Reads the header of the three model FITS files (single‑Sérsic,
+	  Sérsic+Exp, double‑Sérsic) and extracts the fitted parameters,
+	  log‑likelihood, and BIC.
+	- Computes the Residual Flux Fraction (RFF) via ``rff_calc``.
+	- Determines the best model (single S or double S+S) based on BIC.
+	- Calculates Δlog‑likelihood between the models.
+	- Appends all information to the file ``{sample}_profit_{save_value}.dat``.
+
+	Args:
+		sample     (str): Sample name.
+		catalogo   (list of str): List of cluster IDs to process.
+		modeltype  (int): Mode identifier (0/1/2). Used to retrieve the
+						  correct FITS filenames via ``infotype``.
+		ass        (float): Asymmetry index to be written to the summary.
+		save_value (str): Tag for file names.
+
+	Returns:
+		None.  The summary file is updated on disk.
+
+	Note:
+		This function assumes that the FITS files and the likelihood maps
+		have already been created by the fitting routines.  It also writes
+		an entry for every cluster in ``catalogo``, even if a fit failed
+		(the earlier code had a commented try/except that filled zeros).
+	"""
+
+
 	#results_dir=f'{sample}/{cluster}/{save_value}'#f'{sample}/{cluster}'
 	ok=[]
 	with open(f'{sample}_profit_{save_value}_chi2.dat','r') as inp2:
@@ -782,37 +1256,135 @@ def finish_details(sample,catalogo,modeltype,ass,save_value):
 			# 	output.close()
 	return
 ##########################################
+# ----------------------------------------------------------------------
+# Multiprocessing wrappers
+# ----------------------------------------------------------------------
+##########################################
+
 def run_sersic_setup(args):
+	"""Unpack arguments and call ``sersic_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		None
+	"""
+
+
 	sample, cl, i= args
 	return sersic_setup(sample, cl, i)
 def run_sersic_duplo_setup(args):
+	"""Unpack arguments and call ``sersic_duplo_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		None.
+	"""
+
+
 	sample, cl, i= args
 	return sersic_duplo_setup(sample, cl, i)
 def run_sersic_simul_s_setup(args):
+	"""Unpack arguments and call ``sersic_simul_s_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		None
+	"""
+
+
 	sample, cl, i= args
 	return sersic_simul_s_setup(sample, cl, i)
 def run_sersic_duplo_simul_s_setup(args):
+	"""Unpack arguments and call ``sersic_duplo_simul_s_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		None
+	"""
+
+
 	sample, cl, i= args
 	return sersic_duplo_simul_s_setup(sample, cl, i)
 
 def run_sersic_simul_ss_setup(args):
+	"""Unpack arguments and call ``sersic_simul_ss_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		None
+	"""
+
+
 	sample, cl, i= args
 	return sersic_simul_ss_setup(sample, cl, i)
 def run_sersic_duplo_simul_ss_setup(args):
+	"""Unpack arguments and call ``sersic_duplo_simul_ss_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		Whatever ``sersic_duplo_simul_ss_setup`` returns.
+	"""
+
+
 	sample, cl, i= args
 	return sersic_duplo_simul_ss_setup(sample, cl, i)
 
 
 def run_simul_setup(args):
+	"""(Deprecated? Unused in current code.) Unpack and call ``simul_s_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value)
+
+	Returns:
+		Whatever ``simul_s_setup`` returns.
+	"""
+
+
 	sample, cl, i= args
 	return simul_s_setup(sample, cl, i)
 def run_desi_setup(args):
+	"""Unpack arguments and call ``desi_setup``.
+
+	Args:
+		args (tuple): (sample, cluster, save_value, ra, dec)
+
+	Returns:
+		Whatever ``desi_setup`` returns.
+	"""
+
+
 	sample, cl, i,ra,dec= args
 	return desi_setup(sample, cl, i,ra,dec)
 
 def zelador(sample,cluster,pasta):
+	"""Clean (delete) all files inside a cluster's temporary directory.
+
+	Args:
+		sample  (str): Sample name.
+		cluster (str): Cluster identifier.
+		pasta   (str): Sub‑directory to be emptied.
+
+	Returns:
+		None.  Executes an ``rm -r`` command.
+	"""
+	
 	call(f'rm -r {sample}/{cluster}/{pasta}/*',shell=True)
 	return
+
+
 if __name__ == '__main__':
 	import sys
 	sample=sys.argv[1]
