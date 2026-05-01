@@ -1,6 +1,5 @@
 ### Data Science - Photometric Astronomy
-
-
+---
 
 On this project will have all my codes that was designed as part to obtaing my PhD on Astrophysics. 
 
