@@ -19,21 +19,128 @@ from subprocess import call
 warnings.filterwarnings("ignore")
 import multiprocess as mp
 
+"""
+graficos_sersic_models_multiprocessing.py
+
+Isophotal surface‑brightness profile fitting and diagnostic plotting for WHL BCGs.
+
+This module performs:
+- Extraction of 1D radial profiles (surface brightness, ellipticity,
+  position angle, Fourier coefficients) from Photutils isophote tables.
+- Fitting of single‑Sérsic, Sérsic+Exponential, and double‑Sérsic models
+  to the observed surface‑brightness profile.
+- Measurement of colour gradients (g‑r) using both free‑geometry and
+  fixed‑geometry isophotes.
+- Computation of the Residual Flux Fraction (RFF) from the difference
+  between the data and the best single‑Sérsic model.
+- Determination of internal vs. external component regimes from the
+  intersection of model components.
+- Calculation of averaged Fourier coefficients and their radial trends.
+- Production of a large set of diagnostic plots (profile fits, colour
+  gradients, Fourier coefficient trends) for each galaxy.
+
+Multiprocessing is used to process many galaxies in parallel.
+
+Global assumptions:
+- Input files are expected under ``WHL_gr/{cluster}/`` (isophote tables)
+  and output is written under ``WHL_sky/{cluster}/`` and various
+  sub‑directories.
+- The parent catalogue ``checkiso_WHL.dat`` lists galaxies that passed
+  a previous quality check.
+"""
+
+#############################
+# ----------------------------------------------------------------------
+# Linear and surface‑brightness model functions
+# ----------------------------------------------------------------------
 #############################
 def linfunc(x,a,b):
+	"""Linear function y = a * x + b.
+
+	Used throughout the code as the basic linear fit.
+
+	Args:
+		x (float or array_like): Independent variable.
+		a (float): Slope.
+		b (float): Intercept.
+
+	Returns:
+		array_like: a * x + b.
+	"""
+
 	return a*x+b
 ############################
 def sersic(x,ie,re,n):
+	"""Sérsic surface‑brightness profile in mag/arcsec².
+
+	The model magnitude at radius x is:
+
+		μ(x) = -2.5 log₁₀( I_e * exp(-b_n * ((x/r_e)^{1/n} - 1)) ) + 22.5
+
+	where b_n is the asymptotic approximation for the Sérsic constant
+	(Ciotti & Bertin 1999).  All parameters are taken in absolute value
+	to avoid numerical issues.
+
+	Args:
+		x  (float or array_like): Radius (arcsec).
+		ie (float): Central intensity (flux/arcsec², pre‑magnitude).
+		re (float): Effective radius (arcsec).
+		n  (float): Sérsic index (positive; negative values are made positive).
+
+	Returns:
+		array_like: Surface brightness μ (mag/arcsec²).
+	"""
+
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	i=-2.5*np.log10(abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.)))+22.5
 	return i
 ##############################
 def sersicexp(x,ie,re,n,i0,rd):
+	"""Sérsic + exponential surface‑brightness profile.
+
+	The total intensity is the sum of a Sérsic law (with parameters
+	ie, re, n) and an exponential disk (i0, rd).  Converted to
+	magnitudes as in ``sersic``.
+
+	Args:
+		x  (array_like): Radius (arcsec).
+		ie (float): Central intensity of the Sérsic component.
+		re (float): Effective radius of the Sérsic component.
+		n  (float): Sérsic index.
+		i0 (float): Central intensity of the exponential component.
+		rd (float): Scale length of the exponential.
+
+	Returns:
+		array_like: Total surface brightness (mag/arcsec²).
+	"""
+
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	i=-2.5*np.log10(abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.))+abs(i0)*np.exp(-np.divide(x,abs(rd))))+22.5
 	return i
 #################################
 def doublesersic(x,ie,re,n,i0,rd,nd):
+	"""Double‑Sérsic (Sérsic+Sérsic) surface‑brightness profile.
+
+	The two components are added in intensity space, then converted
+	to magnitudes.  Parameters:
+	- First component: ie, re, n
+	- Second component: i0, rd, nd (its Sérsic index)
+
+	Args:
+		x  (array_like): Radius (arcsec).
+		ie (float): Central intensity of component 1.
+		re (float): Effective radius of component 1.
+		n  (float): Sérsic index of component 1.
+		i0 (float): Central intensity of component 2.
+		rd (float): Effective radius of component 2.
+		nd (float): Sérsic index of component 2.
+
+	Returns:
+		array_like: Total surface brightness (mag/arcsec²).
+	"""
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	bnd=2.*abs(nd)-1./3+4./405/abs(nd)+46./25515/abs(nd)**2+131./1148175/abs(nd)**3-2194697./30690717750/abs(nd)**4
 	s1=abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.))
@@ -42,10 +149,55 @@ def doublesersic(x,ie,re,n,i0,rd,nd):
 	return i
 ###############################
 def envel(x,i0,rd):
+	"""Exponential disk surface‑brightness profile (mag/arcsec²).
+
+	Equivalent to ``sersicexp`` with the Sérsic component set to zero.
+
+	Args:
+		x  (array_like): Radius.
+		i0 (float): Central intensity.
+		rd (float): Scale length.
+
+	Returns:
+		array_like: Exponential profile μ.
+	"""
+
 	i=-2.5*np.log10(abs(i0)*np.exp(-np.divide(x,abs(rd))))+22.5
 	return i
 ####################################
+# ----------------------------------------------------------------------
+# Profile fitting
+# ----------------------------------------------------------------------
+####################################
 def modelagem(x,y,sig):
+	"""Fit Sérsic, Sérsic+Exponential, and double‑Sérsic models to
+	a surface‑brightness profile.
+
+	The fitting uses ``scipy.optimize.curve_fit`` with bounds and
+	multiple random restarts to avoid local minima.  The reduced
+	χ² values for the three models are returned, along with the
+	χ² ratio (single vs. composite) used as a model selection
+	criterion.
+
+	Args:
+		x   (array_like): Radius values (arcsec).
+		y   (array_like): Surface brightness (mag/arcsec²).
+		sig (array_like): 1‑sigma errors on y.
+
+	Returns:
+		tuple:
+			chirat_1  (float): χ²_s / χ²_se
+			chirat_2  (float): χ²_s / χ²_ss
+			chisq_s   (float): Reduced χ² of the single Sérsic fit.
+			chisq_se  (float): Reduced χ² of the Sérsic+Exponential fit.
+			chisq_ss  (float): Reduced χ² of the double‑Sérsic fit.
+			spopt     (array): Best‑fit parameters [ie, re, n] for Sérsic.
+			sepopt    (array): Best‑fit parameters [ie, re, n, i0, rd] for S+E.
+			sspopt    (array): Best‑fit parameters [ie, re, n, i0, rd, nd] for S+S.
+			spcov, sepcov, sspcov: covariance matrices (from the final fit).
+	"""
+
+
 	bounds_s=((-np.inf,-np.inf,0.5),(np.inf,np.inf,15.))	
 	bounds_se=((-np.inf,-np.inf,0.5,-np.inf,-np.inf),(np.inf,np.inf,10.,np.inf,np.inf))	
 	bounds_ss=((-np.inf,-np.inf,0.5,-np.inf,-np.inf,0.5),(np.inf,np.inf,10.,np.inf,np.inf,15.))	
@@ -96,6 +248,20 @@ def modelagem(x,y,sig):
 	return chirat_1,chirat_2,chisq_s_1,chisq_se,chisq_ss,spopt,sepopt,sspopt,spcov,sepcov,sspcov
 ###################################
 def total_flux(ie,re,n):
+	"""Analytic total flux of a Sérsic profile (with asymptotic b_n).
+
+	The integrated flux F = I_e * 2π * r_e² * n * (e^{b_n} / b_n^{2n}) * Γ(2n).
+	For integer 2n, Γ(2n) = (2n-1)! is used; otherwise the gamma function.
+
+	Args:
+		ie (float): Central intensity.
+		re (float): Effective radius.
+		n  (float): Sérsic index.
+
+	Returns:
+		float: Total flux (arbitrary units).
+	"""
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	fac=2*n-1
 	if fac > 0:
@@ -105,7 +271,36 @@ def total_flux(ie,re,n):
 		i = ie*2*np.pi*np.power(re,2)*n*(np.divide(np.exp(bn),np.power(bn,2*n)))*scs.gamma(nfac)
 	return i
 ################################################################################################################################################
+# ----------------------------------------------------------------------
+# Component separation and isophotal sub‑region analysis
+# ----------------------------------------------------------------------
+################################################################################################################################################
 def param_intern_extern(slice_interno_start,slice_interno_stop,slice_externo_start,slice_externo_stop,sma,a3,b3,a4,b4,a3_err,b3_err,a4_err,b4_err,intens_fix_r,int_fix_err_r,intens_fix_g,int_fix_err_g,sigmaskyg):
+	"""Compute averaged properties for an inner and outer radial region.
+
+	For both the internal and external slices, the function:
+	- Computes g‑r colour gradients (slope α in log(R) and R^{1/4} space).
+	- Averages the Fourier coefficients (a3, a4, b3, b4) and the
+	  “diskness” parameter (a4/sma), weighting by 1/σ².
+	Pixels where the g‑band intensity is below the sky RMS are excluded.
+
+	Args:
+		slice_interno_start/stop, slice_externo_start/stop (int):
+			Index limits for the slices.
+		sma, a3, b3, a4, b4, a3_err, b3_err, a4_err, b4_err:
+			Isophotal arrays.
+		intens_fix_r, int_fix_err_r,
+		intens_fix_g, int_fix_err_g: Fixed‑geometry intensities and errors.
+		sigmaskyg (float): Sky RMS in g band.
+
+	Returns:
+		list: A 14‑element vector with (α_log_int, α_log_ext,
+			  α_int, α_ext, weighted means of a3, a4, b3, b4,
+			  and diskness for both regions).  If too few
+			  valid points exist, values are set to -1000.
+	"""
+
+
 	###################################################
 	#LIMITES
 	slice_interno=slice(slice_interno_start,slice_interno_stop)
@@ -237,6 +432,21 @@ def param_intern_extern(slice_interno_start,slice_interno_stop,slice_externo_sta
 	return vec_intern_extern
 ####################################
 def modelflux(vec_se,vec_ss):
+	"""Compute the total and relative fluxes of the Sérsic+Exponential
+	and double‑Sérsic components using ``total_flux``.
+
+	Args:
+		vec_se (array): [ie, re, n, i0, rd] for S+E.
+		vec_ss (array): [ie, re, n, i0, rd, nd] for S+S.
+
+	Returns:
+		tuple: Fluxes and fractional contributions for the two models.
+			(flux_sersic_se, flux_env_se, flux_se,
+			 frac_sersic_se, frac_env_se,
+			 flux_sersic_1_ss, flux_sersic_2_ss, flux_ss,
+			 frac_sersic_1_ss, frac_sersic_2_ss)
+	"""
+
 	flux_sersic_se=total_flux(*vec_se[:3])
 	flux_env_se=total_flux(*vec_se[3:5],1.)
 	flux_se=flux_env_se+flux_sersic_se
@@ -253,113 +463,43 @@ def modelflux(vec_se,vec_ss):
 
 	return flux_sersic_se,flux_env_se,flux_se,frac_sersic_se,frac_env_se,flux_sersic_1_ss,flux_sersic_2_ss,flux_ss,frac_sersic_1_ss,frac_sersic_2_ss
 ###################################################
-def model_sep(vec_se,vec_ss,sma,a3,b3,a4,b4,a3_err,b3_err,a4_err,b4_err,intens_fix_r,int_fix_err_r,intens_fix_g,int_fix_err_g,sigmaskyg):
-	vec_diff_se=sersic(sma,*vec_se[:3])-envel(sma,*vec_se[3:5])#
-	
-	xx_se=ma.masked_where(sersic(sma,*vec_se[:3])-envel(sma,*vec_se[3:5]) < 0,vec_diff_se)
-	
-	env_slice=ma.notmasked_contiguous(xx_se)
-	bojo_slice=ma.clump_masked(xx_se)
-	
-	if len(env_slice) == 1 and len(bojo_slice) == 1:
-		if env_slice[0].start == 0:
-			if 5 < env_slice[0].stop < len(sma):
-				mod_which_se='mod_split_se'
-				func_intern_se='exp_intern'
-				se_slices=[env_slice[0].start,env_slice[0].stop,bojo_slice[0].start,bojo_slice[0].stop]
-			else:
-				mod_which_se='mod_split_se_small'
-				func_intern_se='exp_intern'		
-				se_slices=[env_slice[0].start,env_slice[0].stop,bojo_slice[0].start,bojo_slice[0].stop]
-		else:
-			if env_slice[0].start > 5:
-				if env_slice[0].stop - env_slice[0].start > 10:
-					mod_which_se='mod_split_se'
-					func_intern_se='sersic_intern'
-					se_slices=[bojo_slice[0].start,bojo_slice[0].stop,env_slice[0].start,env_slice[0].stop]
-				elif env_slice[0].stop - env_slice[0].start <= 10:
-					mod_which_se='mod_split_se_small'
-					func_intern_se='sersic_intern'
-					se_slices=[bojo_slice[0].start,bojo_slice[0].stop,env_slice[0].start,env_slice[0].stop]
-			else:	
-				mod_which_se='mod_split_se_small'
-				func_intern_se='sersic_intern'
-				se_slices=[bojo_slice[0].start,bojo_slice[0].stop,env_slice[0].start,env_slice[0].stop]
-	elif len(env_slice) == 1 and len(bojo_slice) == 2:
-		##cd 3 componentes
-		mod_which_se='mod_split_se_double'
-		func_intern_se='sersic_intern'
-		se_slices=[-1,-1,-1,-1]
-	else:
-		##cd splitada
-		mod_which_se='mod_part_ss'
-		if bojo_slice != []:
-			func_intern_se='only_sersic'
-			se_slices=[bojo_slice[0].start,bojo_slice[0].stop,-1,-1]
-		if env_slice != []:
-			func_intern_se='only_exp'
-			se_slices=[-1,-1,env_slice[0].start,env_slice[0].stop]
-
-	if -1 not in se_slices:
-		param_se_intern_extern=param_intern_extern(*se_slices,sma,a3,b3,a4,b4,a3_err,b3_err,a4_err,b4_err,intens_fix_r,int_fix_err_r,intens_fix_g,int_fix_err_g,sigmaskyg)
-	else:
-		param_se_intern_extern=[-1000 for _ in range(14)]
-
-	#######################################################################################
-
-	vec_diff_ss=sersic(sma,*vec_ss[:3])-sersic(sma,*vec_ss[3:])#
-	
-	xx_ss=ma.masked_where(sersic(sma,*vec_ss[:3])-sersic(sma,*vec_ss[3:]) < 0,vec_diff_ss)
-	sersic_1_slice=ma.notmasked_contiguous(xx_ss)
-	sersic_2_slice=ma.clump_masked(xx_ss)
-	if len(sersic_2_slice) == 1 and len(sersic_1_slice) == 1:
-		if sersic_1_slice[0].start == 0:
-			if 5 < sersic_1_slice[0].stop < len(sma):
-				mod_which_ss='mod_split_ss'
-				func_intern_ss='sersic_1_intern'
-				ss_slices=[sersic_1_slice[0].start,sersic_1_slice[0].stop,sersic_2_slice[0].start,sersic_2_slice[0].stop]
-			else:
-				mod_which_ss='mod_split_ss_small'
-				func_intern_ss='sersic_1_intern'
-				ss_slices=[sersic_1_slice[0].start,sersic_1_slice[0].stop,sersic_2_slice[0].start,sersic_2_slice[0].stop]
-		else:
-			if sersic_1_slice[0].start > 5:
-				if sersic_1_slice[0].stop - sersic_1_slice[0].start > 10:
-					mod_which_ss='mod_split_ss'
-					func_intern_ss='sersic_2_intern'
-					ss_slices=[sersic_2_slice[0].start,sersic_2_slice[0].stop,sersic_1_slice[0].start,sersic_1_slice[0].stop]
-				elif sersic_1_slice[0].stop - sersic_1_slice[0].start <= 10:
-					mod_which_ss='mod_split_ss_small'
-					func_intern_ss='sersic_2_intern'
-					ss_slices=[sersic_2_slice[0].start,sersic_2_slice[0].stop,sersic_1_slice[0].start,sersic_1_slice[0].stop]
-			else:	
-				mod_which_ss='mod_split_ss_small'
-				func_intern_ss='sersic_2_intern'
-				ss_slices=[sersic_2_slice[0].start,sersic_2_slice[0].stop,sersic_1_slice[0].start,sersic_1_slice[0].stop]
-	elif len(sersic_1_slice) == 1 and len(sersic_2_slice) == 2:
-		##cd 3 componentes
-		mod_which_ss='mod_split_ss_double'
-		func_intern_ss='sersic_intern'
-		ss_slices=-1,-1,-1,-1
-	else:
-		##cd splitada
-		mod_which_ss='mod_part_ss'
-		if sersic_1_slice != []:
-			func_intern_ss='only_sersic_1'
-			ss_slices=[sersic_1_slice[0].start,sersic_1_slice[0].stop,-1,-1]
-		
-		elif sersic_2_slice != []:
-			ss_slices=[-1,-1,sersic_2_slice[0].start,sersic_2_slice[0].stop]
-			func_intern_ss='only_sersic_2'
-	if -1 not in ss_slices:
-		param_ss_intern_extern=param_intern_extern(*ss_slices,sma,a3,b3,a4,b4,a3_err,b3_err,a4_err,b4_err,intens_fix_r,int_fix_err_r,intens_fix_g,int_fix_err_g,sigmaskyg)
-	else:
-		param_ss_intern_extern=[-1000 for _ in range(14)]
-	return mod_which_se,func_intern_se,mod_which_ss,func_intern_ss,*param_se_intern_extern,*param_ss_intern_extern
+def model_sep(vec_se,vec_ss,sma,a3,b3,a4,b4,a3_err,b3_err,a4_err,b4_err,intens_fix_r,int_fix_err_r,intens_fix_g,int_fix_err_g,sigmaskyg):1
 ################################################################################################################################################
-###IMAGEM E GRÁFICOS
+# ----------------------------------------------------------------------
+# Fourier coefficient analysis
+# ----------------------------------------------------------------------
 ################################################################################################################################################
 def coefF(cluster,sma,a3,a3_err,a4,a4_err,b3,b3_err,b4,b4_err):
+	"""Analyse the radial trend of the Fourier coefficients.
+
+	After removing outliers based on IQR, the function computes:
+	- The error‑weighted mean of each coefficient over the whole profile.
+	- A LOWESS smooth (with a fraction of 0.9) to obtain a robust
+	  estimate of the mean and the radial slope.
+	- The slope of the LOWESS model when fitted with a straight line
+	  in R^{1/4} space (for detecting radial variations).
+
+	Diagnostic plots are saved.
+
+	Args:
+		cluster (str): Galaxy identifier.
+		sma, a3, a3_err, a4, a4_err, b3, b3_err, b4, b4_err:
+			Isophotal arrays.
+
+	Returns:
+		tuple:
+			slowvec   (list): Four LOWESS result arrays.
+			vec_med   (list): 15‑element vector with the weighted mean,
+							  LOWESS mean, and slope for each of the
+							  five quantities (a3, a4, b3, b4, diskness).
+			sma_a3, sma_a4, sma_b3, sma_b4: Radius arrays after outlier
+											 removal.
+			a3, a4, b3, b4, a3_err, a4_err, b3_err, b4_err:
+				Cleaned arrays.
+			vec_erro  (list): Five slope uncertainties.
+	"""
+
+
 	a3_iqr,a4_iqr,b3_iqr,b4_iqr=[(sst.iqr(a3),np.percentile(a3,[25,75])),(sst.iqr(a4),np.percentile(a4,[25,75])),(sst.iqr(b3),np.percentile(b3,[25,75])),(sst.iqr(b4),np.percentile(b4,[25,75]))]
 	#
 	a3_lim,a4_lim,b3_lim,b4_lim=(a3_iqr[1][0]-1.5*a3_iqr[0] < a3) & (a3 < a3_iqr[1][1]+1.5*a3_iqr[0]),(a4_iqr[1][0]-1.5*a4_iqr[0] < a4) & (a4 < a4_iqr[1][1]+1.5*a4_iqr[0]),(b3_iqr[1][0]-1.5*b3_iqr[0] < b3) & (b3 < b3_iqr[1][1]+1.5*b3_iqr[0]),(b4_iqr[1][0]-1.5*b4_iqr[0] < b4) & (b4 < b4_iqr[1][1]+1.5*b4_iqr[0])
@@ -399,8 +539,33 @@ def coefF(cluster,sma,a3,a3_err,a4,a4_err,b3,b3_err,b4,b4_err):
 		vec_erro.append(slope_erro[0][0])
 	return slowvec,vec_med,sma_a3,sma_a4,sma_b3,sma_b4,a3,a4,b3,b4,a3_err,a4_err,b3_err,b4_err,vec_erro
 ##############################################################################################################################
+# ----------------------------------------------------------------------
+# Diagnostic and model plots
+# ----------------------------------------------------------------------
 ############################################################################################################################
 def modelplots(cluster,sma,mag_iso,mag_err,spopt,sepopt,sspopt,chisq_s,chisq_se,chisq_ss):
+	"""Create multi‑panel plots of the best‑fit models and the RFF.
+
+	Generates:
+	- Three‑panel view (single Sérsic, S+E, S+S) with components
+	  overplotted.
+	- Two‑panel view (single Sérsic and double Sérsic only).
+	- A “RFF linear” plot showing the area between the data and the
+	  single Sérsic model.
+
+	Args:
+		cluster (str): Galaxy ID.
+		sma     (array): Semi‑major axis (arcsec).
+		mag_iso (array): Observed surface brightness.
+		mag_err (array): Error on mag_iso.
+		spopt, sepopt, sspopt: Best‑fit parameters.
+		chisq_s, chisq_se, chisq_ss: Reduced χ² values.
+
+	Returns:
+		None.  Saves PNG files to the cluster directory and to
+		``WHL_sky/sersic_fits/`` and ``WHL_sky/rff_linear/``.
+	"""
+
 	ylim=[np.max(mag_iso)+(np.max(mag_iso)-np.min(mag_iso))/10.,np.min(mag_iso)-(np.max(mag_iso)-np.min(mag_iso))/10.]
 	fig,axs=plt.subplots(1,3,figsize=(15, 5))#,sharey=True)
 	plt.subplots_adjust(hspace=0.35, wspace=0.35)
@@ -476,8 +641,34 @@ def modelplots(cluster,sma,mag_iso,mag_err,spopt,sepopt,sspopt,chisq_s,chisq_se,
 
 	return
 ####################################################################################################################################################
-####################################################################################################################################################
 def testegr(cluster,sma,sigmaskyg,sigmaskyr,intens_free_g,int_free_err_g,intens_free_r,int_free_err_r, intens_fix_g,int_fix_err_g,intens_fix_r,int_fix_err_r):
+	"""Measure the g‑r colour gradient using both free‑geometry
+	and fixed‑geometry isophotes.
+
+	The slope of the colour vs. radius relation is fitted in both
+	log(R) and R^{1/4} spaces.  Plots of the data and linear fits
+	are saved.
+
+	Args:
+		cluster (str): Galaxy ID.
+		sma     (array): Semi‑major axis (arcsec).
+		sigmaskyg, sigmaskyr (float): Sky RMS in g and r.
+		intens_free_g, int_free_err_g,
+		intens_free_r, int_free_err_r: Free‑geometry intensities and errors.
+		intens_fix_g, int_fix_err_g,
+		intens_fix_r, int_fix_err_r: Fixed‑geometry intensities and errors.
+
+	Returns:
+		tuple:
+			smagr_free, test_gr_free, test_gr_err_free,
+			smagr_fix, test_gr_fix, test_gr_err_fix,
+			free_popt, fix_popt: Best‑fit slope and intercept (R^{1/4} space).
+			corvec (list): [α(log,fix), α(R^{1/4},fix),
+							α(log,free), α(R^{1/4},free)].
+			cor_erro (list): Corresponding slope variance estimates.
+	"""
+
+
 	if np.isnan(sigmaskyg) == True:
 		sigmasky=sigmaskyr
 	else:
@@ -594,9 +785,24 @@ def testegr(cluster,sma,sigmaskyg,sigmaskyr,intens_free_g,int_free_err_g,intens_
 
 	corvec=[fix_log_popt[0],fix_popt[0],free_log_popt[0],free_popt[0]]
 	return smagr_free,test_gr_free,test_gr_err_free,smagr_fix,test_gr_fix,test_gr_err_fix,free_popt,fix_popt,corvec,cor_erro
-######################################################################################################################################################
 ###############################################################################################################################################
 def analise(cluster,sma,mag_iso,mag_err,eps,ellip_err,pa,pa_err,sma_a3,a3,a3_err,sma_a4,a4,a4_err,sma_b3,b3,b3_err,sma_b4,b4,b4_err,slowvec, smagr_free,test_gr_free,test_gr_err_free,smagr_fix,test_gr_fix,test_gr_err_fix,free_popt,fix_popt):
+	"""Create a large 3x3 summary plot combining all isophotal information.
+
+	Panels show: surface brightness, ellipticity, position angle,
+	Fourier coefficients a3, a4, b3, b4 with LOWESS curves, and
+	the g‑r colour gradients (free and fixed geometry).
+
+	Args:
+		cluster (str): Galaxy ID.
+		All other arguments are the various isophotal arrays and fit
+		results obtained earlier.
+
+	Returns:
+		None.  Saves a single PNG to ``WHL_sky/analise/{cluster}.png``.
+	"""
+
+
 	fig, axs = plt.subplots(3,3,figsize=(27,21))
 	plt.subplots_adjust(hspace=0.35, wspace=0.35)
 	plt.suptitle(cluster,fontsize=10)
@@ -658,9 +864,22 @@ def analise(cluster,sma,mag_iso,mag_err,eps,ellip_err,pa,pa_err,sma_a3,a3,a3_err
 	plt.savefig(f'WHL_sky/analise/{cluster}.png')
 	plt.close()
 	return
-################################################################################################################################################
 ##############################################################################################################################################
 def rawplots(cluster,sma,mag_iso,mag_err,eps,ellip_err,pa,pa_err):
+	"""Quick‑look plots of surface brightness, ellipticity, and PA alone.
+
+	Saves individual PNG files and a combined 3‑panel figure.
+
+	Args:
+		cluster (str): Galaxy ID.
+		sma, mag_iso, mag_err: Surface brightness profile.
+		eps, ellip_err: Ellipticity profile.
+		pa, pa_err: Position angle (radians).
+
+	Returns:
+		None.
+	"""
+
 	fig,axs=plt.subplots(1,3,figsize=(9, 3))
 	plt.subplots_adjust(hspace=0.35, wspace=0.35)
 	limy=[np.min(mag_iso)-(np.max(mag_iso)-np.min(mag_iso))/10.,np.max(mag_iso)+(np.max(mag_iso)-np.min(mag_iso))/10.]
@@ -714,9 +933,53 @@ def rawplots(cluster,sma,mag_iso,mag_err,eps,ellip_err,pa,pa_err):
 	plt.close()	
 	
 	return
-###############################################################################################################################################
+####################################################################################################################################################
+# ----------------------------------------------------------------------
+# Main per‑galaxy pipeline
+# ----------------------------------------------------------------------
 ####################################################################################################################################################
 def bcgfigs(cluster,n_controle,ok,okk,info,output_geral,output_modelos,output_erros):
+	"""Master pipeline that processes one galaxy.
+
+	The function:
+	1. Reads the extended isophote table (``WHL_gr/{cluster}/iso_table_gr.dat``).
+	   If it does not exist, writes default values to the output files
+	   and returns.
+	2. Cleans the isophotes by excluding the region where PA becomes
+	   constant (indicating unreliable fits).
+	3. Computes ellipticity and position angle gradients.
+	4. Either retrieves previous model fits (if available in
+	   ``output_modelos``) or runs the three‑model fitting via
+	   ``modelagem``, saving the results.
+	5. Determines the component‑separation regions (S+E and S+S) and
+	   computes the RFF (circular and elliptical).
+	6. Calls all diagnostic plotting functions.
+	7. Compiles the final statistics and appends them to the global
+	   output files (``graph_stats_WHL_sky_v2.dat`` and the error file).
+
+	Args:
+		cluster       (str): Galaxy identifier.
+		n_controle    (int): Index of the galaxy (unused in this function
+							 but passed for compatibility with older code).
+		ok            (list): List of clusters for which model fits were
+							  already saved (used to skip fitting).
+		okk           (list): List of clusters already fully processed
+							  (in the main output file).
+		info          (list): Saved best‑fit parameters for clusters in
+							  ``ok`` (aligned indices).
+		output_geral  (str): Path to the main statistics output file.
+		output_modelos(str): Path to the model‑parameter output file.
+		output_erros  (str): Path to the error output file.
+
+	Returns:
+		None.  Writes results to disk and creates the diagnostic plots.
+
+	Note:
+		The function also loads and writes to ``output_modelos`` and
+		reads ``checkiso_WHL.dat`` indirectly through the caller.
+	"""
+
+
 	if os.path.isfile(f'WHL_gr/{cluster}/iso_table_gr.dat') == False:
 		with open(output_geral,'a') as graph_data:
 			vec=['-1000' for i in range(42)]
@@ -859,10 +1122,35 @@ def bcgfigs(cluster,n_controle,ok,okk,info,output_geral,output_modelos,output_er
 			graph_erros.write(f"{' '.join(map(str, outvec_error))} {' '.join(map(str, vec_erro))} {' '.join(map(str, cor_erro))}\n")
 		return
 def run_bcgfigs(args):
+	"""Multiprocessing wrapper for ``bcgfigs``.
+
+	Args:
+		args (tuple): (cluster, n_controle, ok, okk, info,
+					   output_geral, output_modelos, output_erros)
+
+	Returns:
+		Whatever ``bcgfigs`` returns.
+	"""
+
 	cluster,n_controle,ok,okk,info,output_geral,output_modelos,output_erros = args
 	return bcgfigs(cluster,n_controle,ok,okk,info,output_geral,output_modelos,output_erros)
+####################################################################################################################################################
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+####################################################################################################################################################
 if __name__ == "__main__":
+	"""
+	Parallel processing of all galaxies that passed the isophote
+	extraction step.
 
+	The script:
+	- Opens (or creates) the global statistics files.
+	- Ensures output directories exist.
+	- Reads the list of already‑processed galaxies from
+	  ``graph_stats_WHL_sky_v2.dat`` and skips them.
+	- Distributes the remaining galaxies across 17 processes.
+	"""
 	output_geral='graph_stats_WHL_sky_v2.dat'
 	output_modelos='iso_geral_values_coef_WHL_sky.dat'
 	output_erros='graph_errors_WHL_sky.dat'
