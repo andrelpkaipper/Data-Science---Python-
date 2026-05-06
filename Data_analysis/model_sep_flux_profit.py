@@ -8,18 +8,99 @@ import numpy.ma as ma
 import warnings
 import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
-############################################################################################
 
+"""
+model_sep_flux_profit.py
+
+Component separation and flux correction for 1D surface‑brightness profiles
+using both GalFit and Profit fitted models.
+
+This module provides:
+
+- Analytical Sérsic, Sérsic+Exponential, and double‑Sérsic surface‑brightness
+  profile functions in magnitude units (mag/arcsec²).
+- A function to compute the total flux of a Sérsic component analytically.
+- A flux‑correction routine (``btcorrection``) that calculates the fraction
+  of light recovered within a Kron aperture relative to the total infinite
+  flux, for each component of a double‑Sérsic model.
+- A model‑separation routine (``model_sep``) that determines the radial
+  ranges where one component dominates over the other, used to define
+  inner and outer structural regions.
+- A set of diagnostic plotting functions (``modelplots``, ``bcgfigs``) that
+  compare the GalFit and Profit 1D model profiles.
+
+The main block reads the Profit observation catalogue and Kron radius data
+for the L07 sample, computes the component flux corrections, and saves the
+result to a text file.
+
+Global assumptions:
+- Input files are located under ``{sample}_files/``.
+- The Profit observation catalogue has a header file ``profit_observation.header``.
+- The Kron radius file ``kron_radius_L07.dat`` provides the Kron radius for
+  each galaxy.
+"""
+
+############################################################################################
+# ----------------------------------------------------------------------
+# Surface‑brightness profile functions (magnitudes)
+# ----------------------------------------------------------------------
+############################################################################################
 def sersic(x,ie,re,n):
+    """Sérsic surface‑brightness profile in mag/arcsec².
+
+    Uses the asymptotic approximation for bₙ (Ciotti & Bertin 1999).
+    All parameters are taken in absolute value to avoid numerical issues.
+
+    Args:
+        x  (array_like): Radius (arcsec).
+        ie (float): Central intensity (flux/arcsec², in arbitrary units).
+        re (float): Effective radius (arcsec).
+        n  (float): Sérsic index (positive).
+
+    Returns:
+        array_like: μ(x) in mag/arcsec².
+    """
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	i=-2.5*np.log10(abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.)))+22.5
 	return i
 def sersicexp(x,ie,re,n,i0,rd):
+    """Sérsic + exponential disk profile (mag/arcsec²).
+
+    The total intensity is the sum of a Sérsic law and an exponential disk
+    (Sérsic index fixed to n=1).  Converted to magnitudes as in ``sersic``.
+
+    Args:
+        x  (array_like): Radius (arcsec).
+        ie (float): Central intensity of the Sérsic component.
+        re (float): Effective radius of the Sérsic component.
+        n  (float): Sérsic index.
+        i0 (float): Central intensity of the exponential component.
+        rd (float): Scale length of the exponential.
+
+    Returns:
+        array_like: Total μ (mag/arcsec²).
+    """
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	b1=2.*abs(1.)-1./3+4./405/abs(1.)+46./25515/abs(1.)**2+131./1148175/abs(1.)**3-2194697./30690717750/abs(1.)**4
 	i=-2.5*np.log10(abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.))+abs(i0)*np.exp(-np.divide(x,abs(rd))))+22.5
 	return i
 def doublesersic(x,ie,re,n,i0,rd,nd):
+    """Double‑Sérsic (Sérsic+Sérsic) profile (mag/arcsec²).
+
+    The two components are added in intensity space, then converted to
+    magnitudes.
+
+    Args:
+        x  (array_like): Radius (arcsec).
+        ie, re, n: Parameters for the first (inner) component.
+        i0, rd, nd: Parameters for the second (outer) component.
+
+    Returns:
+        array_like: Total μ (mag/arcsec²).
+    """
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	bnd=2.*abs(nd)-1./3+4./405/abs(nd)+46./25515/abs(nd)**2+131./1148175/abs(nd)**3-2194697./30690717750/abs(nd)**4
 	s1=abs(ie)*np.exp(-bn*((np.divide(x,abs(re)))**(1./abs(n))-1.))
@@ -27,9 +108,37 @@ def doublesersic(x,ie,re,n,i0,rd,nd):
 	i=-2.5*np.log10(s1+s2)+22.5
 	return i
 def envel(x,i0,rd):
+    """Exponential disk profile alone (mag/arcsec²).
+
+    Equivalent to ``sersicexp`` with the Sérsic component set to zero.
+
+    Args:
+        x  (array_like): Radius (arcsec).
+        i0 (float): Central intensity.
+        rd (float): Scale length.
+
+    Returns:
+        array_like: μ(x) in mag/arcsec².
+    """
+
 	i=-2.5*np.log10(abs(i0)*np.exp(-np.divide(x,abs(rd))))+22.5
 	return i
 def total_flux(ie,re,n):
+    """Analytic total flux of a Sérsic profile.
+
+    F = I_e · 2π · r_e² · n · (e^{b_n} / b_n^{2n}) · Γ(2n)
+
+    For integer 2n, Γ(2n) = (2n‑1)! is used; otherwise the gamma function.
+
+    Args:
+        ie (float): Central intensity.
+        re (float): Effective radius.
+        n  (float): Sérsic index.
+
+    Returns:
+        float: Total flux (arbitrary units).
+    """
+
 	bn=2.*abs(n)-1./3+4./405/abs(n)+46./25515/abs(n)**2+131./1148175/abs(n)**3-2194697./30690717750/abs(n)**4
 	fac=2*n-1
 	if fac > 0:
@@ -38,30 +147,103 @@ def total_flux(ie,re,n):
 		nfac=fac+1
 		i = ie*2*np.pi*np.power(re,2)*n*(np.divide(np.exp(bn),np.power(bn,2*n)))*scs.gamma(nfac)
 	return i
-
+############################################################################################
+# ----------------------------------------------------------------------
+# Sérsic profiles using total magnitude parameterisation
+# ----------------------------------------------------------------------
+############################################################################################
 def musersic(r,re,n,mtot):
+    """Sérsic surface‑brightness profile defined by total magnitude.
+
+    Args:
+        r    (array_like): Radius (arcsec).
+        re   (float): Effective radius (arcsec).
+        n    (float): Sérsic index.
+        mtot (float): Total apparent magnitude.
+
+    Returns:
+        array_like: μ(r) in mag/arcsec².
+    """
+
 	bn = 2.*n-1/3.+4./(405.*n)+46./(25515*n**2)+131./(1148175*n**3)-2194697./(30690717750*n**4)
 	mue = mtot + 5*np.log10(re) + 2.5*np.log10(2*pi*n*np.exp(bn)*scs.gamma(2*n)/np.power(bn,2*n))
 	return mue+2.5*bn*(np.power(r/re,1./n)-1.)/np.log(10.)
 def mudouble(r,re,n,mtot,re2,n2,mtot2):
+    """Double‑Sérsic profile defined by total magnitudes.
+
+    Args:
+        r    (array_like): Radius (arcsec).
+        re, n, mtot: Parameters for the first component.
+        re2, n2, mtot2: Parameters for the second component.
+
+    Returns:
+        array_like: Total μ in mag/arcsec².
+    """
+
 	bn = 2.*n-1/3.+4./(405.*n)+46./(25515*n**2)+131./(1148175*n**3)-2194697./(30690717750*n**4)
 	mue = mtot + 5*np.log10(re) + 2.5*np.log10(2*pi*n*np.exp(bn)*scs.gamma(2*n)/np.power(bn,2*n))
 	bn2 = 2*n2-1/3.+4./(405.*n2)+46./(25515*n2**2)+131./(1148175*n2**3)-2194697./(30690717750*n2**4)
 	mue2 = mtot2 + 5*np.log10(re2) + 2.5*np.log10(2*pi*n2*np.exp(bn2)*scs.gamma(2*n2)/np.power(bn2,2*n2))
 	return -2.5*np.log10(np.power(10,-0.4*(mue+2.5*bn*(np.power(r/re,1./n)-1.)/np.log(10.)))+np.power(10,-0.4*(mue2+2.5*bn2*(np.power(r/re2,1./n2)-1.)/np.log(10.))))
 def muonly(r,re,n,mtot):
+    """Single‑Sérsic profile (magnitude form), identical to ``musersic``.
+
+    Provided as a convenience alias.
+
+    Args:
+        r, re, n, mtot: as in ``musersic``.
+
+    Returns:
+        array_like: μ(r) in mag/arcsec².
+    """
+
 	bn = 2.*n-1/3.+4./(405.*n)+46./(25515*n**2)+131./(1148175*n**3)-2194697./(30690717750*n**4)
 	mue = mtot + 5*np.log10(re) + 2.5*np.log10(2*pi*n*np.exp(bn)*scs.gamma(2*n)/np.power(bn,2*n))
 	i= -2.5*np.log10(np.power(10,-0.4*(mue+2.5*bn*(np.power(r/re,1./n)-1.)/np.log(10.))))
 	return i
-
 def mulinear(r,re,n,mtot):
+    """Linear (flux) version of a Sérsic profile.
+
+    Returns the intensity I(r) in linear flux units (not magnitudes).
+
+    Args:
+        r, re, n, mtot: as in ``musersic``.
+
+    Returns:
+        array_like: I(r) in flux/arcsec².
+    """
+
 	bn = 2.*n-1/3.+4./(405.*n)+46./(25515*n**2)+131./(1148175*n**3)-2194697./(30690717750*n**4)
 	mue = mtot + 5*np.log10(re) + 2.5*np.log10(2*pi*n*np.exp(bn)*scs.gamma(2*n)/np.power(bn,2*n))
 	i= np.power(10,-0.4*(mue+2.5*bn*(np.power(r/re,1./n)-1.)/np.log(10.)))
 	return i
-
+############################################################################################
+# ----------------------------------------------------------------------
+# Flux correction for Kron apertures
+# ----------------------------------------------------------------------
+############################################################################################
 def btcorrection(cluster,r_kron,vec_double_model):
+    """Compute the fraction of light of each Sérsic component inside a
+    given Kron radius.
+
+    The function integrates the linear intensity profiles of the two
+    components from 0 to infinity (total flux) and from 0 to ``r_kron``
+    (flux within the aperture).  The ratio gives the correction factor
+    needed to recover the total flux of each component.
+
+    Args:
+        cluster         (str): Galaxy identifier (used only in output).
+        r_kron          (float): Kron radius (arcsec).
+        vec_double_model (array_like): Six‑element vector
+            [re1, n1, mag1, re2, n2, mag2] defining the double‑Sérsic model.
+            The magnitudes are total apparent magnitudes.
+
+    Returns:
+        list: [cluster, corr_1, corr_2] where corr_1 and corr_2 are the
+              correction factors (>0, ≤1) for the first and second components,
+              respectively.
+    """
+
 	
 	x0=lambda r:mulinear(r,*vec_double_model[:3])*2*np.pi
 	x1=lambda r:mulinear(r,*vec_double_model[3:])*2*np.pi
@@ -76,9 +258,41 @@ def btcorrection(cluster,r_kron,vec_double_model):
 	corr_2=flux_c2_kron[0]/flux_c2_inf[0]
 	vec=[cluster,corr_1,corr_2]
 	return vec
-
+###################################################################################
+# ----------------------------------------------------------------------
+# Component‑dominance separation
+# ----------------------------------------------------------------------
 ###################################################################################
 def model_sep(sma,vec_se,vec_ss):
+    """Determine the radial intervals where each component dominates for
+    the Sérsic+Exponential and double‑Sérsic models.
+
+    The crossing point between the two components is found by identifying
+    where the difference of their surface‑brightness profiles changes sign.
+    The resulting slices are used to classify the galaxy as having a clean
+    inner/outer separation or not, and to assign the inner and outer
+    indices for further isophotal analysis.
+
+    Args:
+        sma    (array_like): Semi‑major axis values (arcsec).
+        vec_se (array_like): S+E parameters [re, n, mag, re_disk, mag_disk]
+                             (the exponential is assumed n=1).
+        vec_ss (array_like): S+S parameters [re1, n1, mag1, re2, n2, mag2].
+
+    Returns:
+        tuple: (mod_which_se, func_intern_se, mod_which_ss, func_intern_ss)
+            Strings describing the separation geometry:
+            - mod_which_se: e.g., 'mod_split_se', 'mod_part_se'.
+            - func_intern_se: which component is in the inner region
+              ('exp_intern', 'sersic_intern', etc.).
+            - mod_which_ss, func_intern_ss: analogous for the S+S model.
+
+    Note:
+        If the separation cannot be performed (e.g., one component is
+        always fainter), fallback classification like 'mod_part_se' is
+        returned.
+    """
+
 
 	vec_diff_se=muonly(sma,*vec_se[:3])-muonly(sma,*vec_se[3:])#
 	
@@ -174,7 +388,42 @@ def model_sep(sma,vec_se,vec_ss):
 			func_intern_ss='only_sersic_2'
 	return mod_which_se,func_intern_se,mod_which_ss,func_intern_ss
 ###################################################################################
+# ----------------------------------------------------------------------
+# Diagnostic plotting
+# ----------------------------------------------------------------------
+###################################################################################
 def modelplots(cluster,sma,vec_s_galfit,vec_se_galfit,vec_ss_galfit,vec_s_profit,vec_se_profit,vec_ss_profit,chisq_s_galfit,chisq_se_galfit,chisq_ss_galfit,best_model):
+    """Generate three‑panel diagnostic plots comparing GalFit and Profit
+    model profiles.
+
+    For each model type (single Sérsic, S+E, S+S), the GalFit and Profit
+    profiles are overplotted.  The best model (according to BIC) is
+    highlighted in red.  If the GalFit S+E or S+S fit did not converge,
+    an appropriate note is displayed.
+
+    Three figures are saved:
+    - ``graficos_1D/{cluster}_models_all.png``  (both codes)
+    - ``graficos_1D/{cluster}_models_galfit.png`` (GalFit only)
+    - ``graficos_1D/{cluster}_models_profit.png`` (Profit only)
+
+    Args:
+        cluster         (str): Galaxy identifier.
+        sma             (array_like): Semi‑major axis grid.
+        vec_s_galfit    (array): [re, n, mag] for GalFit single Sérsic.
+        vec_se_galfit   (array): [re, n, mag, rd, magd] for GalFit S+E.
+        vec_ss_galfit   (array): [re1, n1, mag1, re2, n2, mag2] for GalFit S+S.
+        vec_s_profit    (array): Same for Profit.
+        vec_se_profit   (array): Same for Profit S+E.
+        vec_ss_profit   (array): Same for Profit S+S.
+        chisq_s_galfit,
+        chisq_se_galfit,
+        chisq_ss_galfit (float): Reduced χ² for GalFit models.
+        best_model      (str): 'S', 'S+E', or 'S+S'.
+
+    Returns:
+        None.
+    """
+
 	if best_model == 'S':
 		model_s='S (best) profit'
 		model_se='S+E profit'
@@ -313,7 +562,44 @@ def modelplots(cluster,sma,vec_s_galfit,vec_se_galfit,vec_ss_galfit,vec_s_profit
 
 	return
 ###################################################################################
+# ----------------------------------------------------------------------
+# Per‑galaxy pipeline
+# ----------------------------------------------------------------------
+###################################################################################
 def bcgfigs(cluster,xc,yc,re_s_galfit,mag_s_galfit,n_s_galfit,reb_se_galfit,magb_se_galfit,nb_se_galfit,red_se_galfit,magd_se_galfit,re1_ss_galfit,mag1_ss_galfit,n1_ss_galfit,re2_ss_galfit,mag2_ss_galfit,n2_ss_galfit,re_s_profit,mag_s_profit,n_s_profit,reb_se_profit,magb_se_profit,nb_se_profit,red_se_profit,magd_se_profit,re1_ss_profit,mag1_ss_profit,n1_ss_profit,re2_ss_profit,mag2_ss_profit,n2_ss_profit,chisq_s_galfit,chisq_se_galfit,chisq_ss_galfit,best_model,r_kron):
+    """Main pipeline for one galaxy: compute flux corrections and
+    generate diagnostic plots.
+
+    This function is called with the full set of GalFit and Profit
+    best‑fit parameters.  It:
+    1. Creates a uniform semi‑major axis grid.
+    2. Calls ``btcorrection`` for the double‑Sérsic Profit model.
+    3. (Optionally) calls ``modelplots`` to produce comparison plots
+       (this call is currently commented out in the original code).
+    4. Returns the flux correction vector.
+
+    Args:
+        cluster       (str): Galaxy ID.
+        xc, yc        (float): Galaxy centre (used to define the max radius).
+        re_s_galfit, mag_s_galfit, n_s_galfit: GalFit single Sérsic parameters.
+        reb_se_galfit, magb_se_galfit, nb_se_galfit,
+        red_se_galfit, magd_se_galfit: GalFit S+E parameters.
+        re1_ss_galfit, mag1_ss_galfit, n1_ss_galfit,
+        re2_ss_galfit, mag2_ss_galfit, n2_ss_galfit: GalFit S+S parameters.
+        re_s_profit, mag_s_profit, n_s_profit: Profit single Sérsic.
+        reb_se_profit, magb_se_profit, nb_se_profit,
+        red_se_profit, magd_se_profit: Profit S+E.
+        re1_ss_profit, mag1_ss_profit, n1_ss_profit,
+        re2_ss_profit, mag2_ss_profit, n2_ss_profit: Profit S+S.
+        chisq_s_galfit, chisq_se_galfit, chisq_ss_galfit: GalFit reduced χ².
+        best_model   (str): 'S', 'S+E', or 'S+S'.
+        r_kron       (float): Kron radius (arcsec).
+
+    Returns:
+        None.  The flux correction is computed internally and can be
+        stored by the caller; diagnostic plots are saved to disk.
+    """
+
 	sma = np.arange(1,max(xc,yc))
 	vec_ss_profit=[re1_ss_profit,n1_ss_profit,mag1_ss_profit,re2_ss_profit,n2_ss_profit,mag2_ss_profit]
 

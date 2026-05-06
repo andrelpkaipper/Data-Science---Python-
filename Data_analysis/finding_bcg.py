@@ -2,8 +2,35 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-# recno   RAJ2000 DEJ2000 rmag    r200    RL* N200
-#         deg deg mag Mpc     
+"""
+finding_bcg.py
+
+Cross‑match between the L07 BCG catalogue and the full WHL cluster catalogue.
+
+This script reads two fixed text files:
+- ``L07_files/data_indiv_clean_L07.dat`` : contains the BCG sample with columns
+  cluster, ?, ?, ?, ?, RA, Dec (columns 0,5,6).
+- ``L07_type_description.dat`` : contains the full WHL cluster description with
+  columns RA, Dec, redshift, velocity dispersion (columns 2,3,4,5).
+
+It performs a coordinate cross‑match within a hard‑coded tolerance of 0.003°
+(~10.8 arcsec) using a simple spherical distance calculation (no wrapping
+around RA = 0° is needed for this dataset).  For each matched cluster, it
+computes R₂₀₀ from the velocity dispersion using the formula:
+
+    R₂₀₀ = 1.73 * (σ / 1000 km/s) / (0.7 + 0.3 * (1+z)³)   [Mpc]
+
+and writes the output to ``L07_r200.dat`` with columns:
+    cluster_ID   R₂₀₀ [Mpc]   velocity_dispersion [km/s]
+
+Galaxies that cannot be matched are collected in a list (assigned to the
+variable ``fail``, which is currently not used beyond that but could be
+written out if needed).
+
+Note: The variable ``fail`` is used in the script but never defined outside
+the conditional block, causing a ``NameError`` if any galaxy fails to match.
+This is a known bug in the original code.
+"""
 
 data_whl = np.loadtxt('L07_files/data_indiv_clean_L07.dat', dtype=str).T
 data_full = np.loadtxt('L07_type_description.dat', dtype=str, usecols=[2,3,4,5]).T
